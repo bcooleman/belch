@@ -21,7 +21,7 @@ use ratatui::{
     Terminal,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader, split, AsyncBufReadExt},
     net::{TcpListener, TcpStream},
 };
 
@@ -53,105 +53,109 @@ fn spawn_proxy_listener(app: Arc<Mutex<App>>) {
             println!("🔌 Proxy listening on http://127.0.0.1:1337");
 
             loop {
-                let (mut client, _) = listener.accept().await.unwrap();
+                let (client, _) = listener.accept().await.unwrap();
                 let app = Arc::clone(&app);
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 8192];
-                    if let Ok(n) = client.read(&mut buf).await {
-                        let request_raw = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let mut lines = request_raw.lines();
-                        let start_line = lines.next().unwrap_or_default();
-                        let parts: Vec<&str> = start_line.split_whitespace().collect();
-                        let method = parts.get(0).copied().unwrap_or("");
-                        let target = parts.get(1).copied().unwrap_or("");
+                    // Separate buffers for client and upstream
+                    let mut client_buf = [0u8; 8192];
+                    let mut upstream_buf = [0u8; 8192];
+                    // Peek initial data
+                    let n = match client.peek(&mut client_buf).await {
+                        Ok(n) => n,
+                        Err(_) => return,
+                    };
+                    let request_raw = String::from_utf8_lossy(&client_buf[..n]).to_string();
+                    let mut lines = request_raw.lines();
+                    let start_line = lines.next().unwrap_or_default();
+                    let parts: Vec<&str> = start_line.split_whitespace().collect();
+                    let method = parts.get(0).copied().unwrap_or("");
+                    let target = parts.get(1).copied().unwrap_or("");
 
-                        // Handle CONNECT (HTTPS)
-                        if method.eq_ignore_ascii_case("CONNECT") {
-                            if let Ok(mut upstream) = TcpStream::connect(target).await {
-                                // Send 200 Connection Established
-                                let _ = client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
-                                // Log CONNECT
-                                {
-                                    let mut guard = app.lock().unwrap();
-                                    guard.logs.push_back(HttpLog {
-                                        url: format!("CONNECT {}", target),
-                                        request: start_line.to_string(),
-                                        response: "[Tunnel established]".to_string(),
-                                    });
-                                }
-                                // Intercept HTTP inside tunnel
-                                loop {
-                                    let mut tbuff = [0u8; 8192];
-                                    match client.read(&mut tbuff).await {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(m) => {
-                                            let req = String::from_utf8_lossy(&tbuff[..m]).to_string();
-                                            // Log tunneled request
-                                            {
-                                                let mut guard = app.lock().unwrap();
-                                                guard.logs.push_back(HttpLog {
-                                                    url: format!("TUNNEL-> {}", target),
-                                                    request: req.clone(),
-                                                    response: String::new(),
-                                                });
-                                            }
-                                            // Forward to upstream
-                                            if upstream.write_all(req.as_bytes()).await.is_ok() {
-                                                let mut resp = Vec::new();
-                                                let _ = upstream.read_to_end(&mut resp).await;
-                                                // Log tunneled response
-                                                {
-                                                    let mut guard = app.lock().unwrap();
-                                                    guard.logs.push_back(HttpLog {
-                                                        url: format!("TUNNEL<- {}", target),
-                                                        request: String::new(),
-                                                        response: String::from_utf8_lossy(&resp).to_string(),
-                                                    });
-                                                }
-                                                // Send back to client
-                                                let _ = client.write_all(&resp).await;
-                                            }
+                    // Split into read/write halves
+                    let (mut client_r, mut client_w) = split(BufReader::new(client));
+
+                    // Handle CONNECT
+                    if method.eq_ignore_ascii_case("CONNECT") {
+                        // Consume CONNECT header
+                        if client_r.read_exact(&mut client_buf[..n]).await.is_err() {
+                            return;
+                        }
+                        // Connect upstream
+                        if let Ok(upstream) = TcpStream::connect(target).await {
+                            let (mut up_r, mut up_w) = split(BufReader::new(upstream));
+                            // Acknowledge tunnel
+                            let _ = client_w.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                            {
+                                let mut guard = app.lock().unwrap();
+                                guard.logs.push_back(HttpLog {
+                                    url: format!("CONNECT {}", target),
+                                    request: start_line.to_string(),
+                                    response: "[Tunnel established]".to_string(),
+                                });
+                            }
+                            // Bidirectional proxy with separate buffers
+                            loop {
+                                tokio::select! {
+                                    Ok(m) = client_r.read(&mut client_buf) => {
+                                        if m == 0 { break; }
+                                        let req = String::from_utf8_lossy(&client_buf[..m]).to_string();
+                                        {
+                                            let mut guard = app.lock().unwrap();
+                                            guard.logs.push_back(HttpLog {
+                                                url: format!("TUNNEL-> {}", target),
+                                                request: req.clone(),
+                                                response: String::new(),
+                                            });
                                         }
+                                        let _ = up_w.write_all(&client_buf[..m]).await;
+                                    }
+                                    Ok(m) = up_r.read(&mut upstream_buf) => {
+                                        if m == 0 { break; }
+                                        let resp = String::from_utf8_lossy(&upstream_buf[..m]).to_string();
+                                        {
+                                            let mut guard = app.lock().unwrap();
+                                            guard.logs.push_back(HttpLog {
+                                                url: format!("TUNNEL<- {}", target),
+                                                request: String::new(),
+                                                response: resp.clone(),
+                                            });
+                                        }
+                                        let _ = client_w.write_all(&upstream_buf[..m]).await;
                                     }
                                 }
                             }
-                        } else {
-                            // Plain HTTP: absolute URL or via Host header
-                            let (host, port, path) = if request_raw.to_lowercase().starts_with("get http://") {
-                                let rest = &request_raw[5..];
-                                let mut split = rest.splitn(2, '/');
-                                let hp = split.next().unwrap_or("");
-                                let mut h = hp;
-                                let mut p = 80;
-                                if let Some(idx) = hp.rfind(':') {
-                                    if let Ok(pp) = hp[idx+1..].parse::<u16>() { p = pp; h = &hp[..idx]; }
-                                }
-                                (h.to_string(), p, format!("/{}", split.next().unwrap_or("")))
-                            } else {
-                                let host_hdr = request_raw
-                                    .lines()
-                                    .find(|l| l.to_lowercase().starts_with("host:"))
-                                    .and_then(|l| l.splitn(2, ' ').nth(1))
-                                    .unwrap_or("127.0.0.1");
-                                let mut hp = host_hdr.split(':');
-                                let h = hp.next().unwrap_or("127.0.0.1").to_string();
-                                let p = hp.next().and_then(|x| x.parse().ok()).unwrap_or(80);
-                                (h, p, parts.get(1).copied().unwrap_or("/").to_string())
-                            };
-                            // Build and forward HTTP request
+                        }
+                    } else {
+                        // Plain HTTP
+                        if let Ok(m) = client_r.read(&mut client_buf).await {
+                            let request = String::from_utf8_lossy(&client_buf[..m]).to_string();
+                            let mut lines = request.lines();
+                            let start = lines.next().unwrap_or_default();
+                            let parts: Vec<&str> = start.split_whitespace().collect();
+                            let method = parts.get(0).copied().unwrap_or("");
+                            let path = parts.get(1).copied().unwrap_or("/");
+                            let host_hdr = request.lines()
+                                .find(|l| l.to_lowercase().starts_with("host:"))
+                                .and_then(|l| l.splitn(2, ' ').nth(1))
+                                .unwrap_or("127.0.0.1");
+                            let mut hp = host_hdr.split(':');
+                            let host = hp.next().unwrap_or("127.0.0.1");
+                            let port = hp.next().and_then(|x| x.parse().ok()).unwrap_or(80);
                             let forward = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", method, path, host);
-                            if let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await {
+                            if let Ok(mut upstream) = TcpStream::connect((host, port)).await {
                                 let _ = upstream.write_all(forward.as_bytes()).await;
                                 let mut resp_buf = Vec::new();
                                 let _ = upstream.read_to_end(&mut resp_buf).await;
-                                let _ = client.write_all(&resp_buf).await;
-                                // Log HTTP
-                                let mut guard = app.lock().unwrap();
-                                guard.logs.push_back(HttpLog {
-                                    url: format!("{} {} [Host: {}]", method, path, host),
-                                    request: forward.clone(),
-                                    response: String::from_utf8_lossy(&resp_buf).to_string().replace("\r\n", "\n"),
-                                });
+                                let resp = String::from_utf8_lossy(&resp_buf).to_string().replace("\r\n", "\n");
+                                {
+                                    let mut guard = app.lock().unwrap();
+                                    guard.logs.push_back(HttpLog {
+                                        url: format!("{} {} [Host: {}]", method, path, host),
+                                        request: forward.clone(),
+                                        response: resp.clone(),
+                                    });
+                                }
+                                let _ = client_w.write_all(&resp_buf).await;
                             }
                         }
                     }
@@ -180,7 +184,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    app: Arc<Mutex<App>>, 
+    app: Arc<Mutex<App>>,
 ) -> std::io::Result<()> {
     loop {
         terminal.draw(|f| {
