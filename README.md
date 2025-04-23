@@ -1,7 +1,7 @@
 Dependencies: cargo v1.85.0<br>
 chmod +x run.sh<br>
 ./run.sh<br><br>
-curl -x http://127.0.0.1:1337 http://google.com/ -L <br><br>
+<code>curl -x http://127.0.0.1:1337 http://google.com/ -L</code> <br><br>
 
 current bug: need to resize the screen once..
 
