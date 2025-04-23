@@ -1,4 +1,4 @@
-// Belch Proxy TUI – Passive HTTP/HTTPS Observer with Split-Screen Viewer
+// Belch Proxy TUI – Passive HTTP Observer with Split-Screen Viewer
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -21,7 +21,7 @@ use ratatui::{
     Terminal,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 
@@ -38,9 +38,7 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
-        Self { logs: VecDeque::new(), selected: 0 }
-    }
+    fn new() -> Self { Self { logs: VecDeque::new(), selected: 0 } }
     fn next(&mut self) { if self.selected + 1 < self.logs.len() { self.selected += 1; } }
     fn previous(&mut self) { if self.selected > 0 { self.selected -= 1; } }
     fn selected_log(&self) -> Option<&HttpLog> { self.logs.get(self.selected) }
@@ -54,86 +52,71 @@ fn spawn_proxy_listener(app: Arc<Mutex<App>>) {
             println!("🔌 Proxy listening on http://127.0.0.1:1337");
 
             loop {
-                if let Ok((mut client, _)) = listener.accept().await {
+                if let Ok((client_socket, _)) = listener.accept().await {
                     let app = Arc::clone(&app);
                     tokio::spawn(async move {
-                        let mut buf = [0u8; 8192];
-                        if let Ok(n) = client.read(&mut buf).await {
-                            let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                            let mut lines = request.lines();
-                            let start_line = lines.next().unwrap_or_default();
-                            let parts: Vec<&str> = start_line.split_whitespace().collect();
-                            let method = parts.get(0).copied().unwrap_or("");
-                            let target = parts.get(1).copied().unwrap_or("");
+                        let mut client = client_socket;
+                        loop {
+                            let mut buf = [0u8; 8192];
+                            match client.read(&mut buf).await {
+                                Ok(0) => break, // connection closed
+                                Ok(n) => {
+                                    let request_raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                                    let mut lines = request_raw.lines();
+                                    let start_line = lines.next().unwrap_or_default();
+                                    let parts: Vec<&str> = start_line.split_whitespace().collect();
+                                    let method = parts.get(0).copied().unwrap_or("");
+                                    let target = parts.get(1).copied().unwrap_or("");
 
-                            // Handle CONNECT tunnels (HTTP(S))
-                            if method.eq_ignore_ascii_case("CONNECT") {
-                                // target is "host:port"
-                                if let Ok(mut upstream) = TcpStream::connect(target).await {
-                                    // Inform client
-                                    let _ = client.write_all(
-                                        b"HTTP/1.1 200 Connection Established\r\n\r\n"
-                                    ).await;
-                                    // Tunnel data both ways
-                                    let _ = copy_bidirectional(&mut client, &mut upstream).await;
+                                    // HTTP-only parsing: absolute URL or Host header
+                                    let (host, port, path) = if target.starts_with("http://") {
+                                        let rest = &target[7..];
+                                        let mut split = rest.splitn(2, '/');
+                                        let hp = split.next().unwrap_or("");
+                                        let mut h = hp;
+                                        let mut p = 80;
+                                        if let Some(idx) = hp.rfind(':') {
+                                            if let Ok(pp) = hp[idx+1..].parse::<u16>() {
+                                                p = pp;
+                                                h = &hp[..idx];
+                                            }
+                                        }
+                                        let pth = format!("/{}", split.next().unwrap_or(""));
+                                        (h.to_string(), p, pth)
+                                    } else {
+                                        let host_hdr = request_raw
+                                            .lines()
+                                            .find(|l| l.to_lowercase().starts_with("host:"))
+                                            .and_then(|l| l.splitn(2, ' ').nth(1))
+                                            .unwrap_or("127.0.0.1");
+                                        let mut hp = host_hdr.split(':');
+                                        let h = hp.next().unwrap_or("127.0.0.1").to_string();
+                                        let p = hp.next().and_then(|x| x.parse().ok()).unwrap_or(80);
+                                        (h, p, target.to_string())
+                                    };
 
-                                    // Log CONNECT
-                                    let mut app = app.lock().unwrap();
-                                    app.logs.push_back(HttpLog {
-                                        url: format!("CONNECT {}", target),
-                                        request: start_line.to_string(),
-                                        response: "Tunnel established".to_string(),
-                                    });
-                                }
-                                return;
-                            }
+                                    // Build and forward HTTP request
+                                    let forward = format!(
+                                        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                                        method, path, host
+                                    );
+                                    if let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await {
+                                        let _ = upstream.write_all(forward.as_bytes()).await;
+                                        let mut resp_buf = Vec::new();
+                                        let _ = upstream.read_to_end(&mut resp_buf).await;
+                                        let _ = client.write_all(&resp_buf).await;
 
-                            // Determine host, port, and clean path for non-CONNECT
-                            let (host, port, path) = if target.starts_with("http://") {
-                                let rest = &target[7..];
-                                let mut split = rest.splitn(2, '/');
-                                let hp = split.next().unwrap_or("");
-                                let mut h = hp;
-                                let mut p = 80;
-                                if let Some(idx) = hp.rfind(':') {
-                                    if let Ok(pp) = hp[idx + 1..].parse::<u16>() {
-                                        p = pp;
-                                        h = &hp[..idx];
+                                        // Log for TUI
+                                        let resp_txt = String::from_utf8_lossy(&resp_buf).to_string();
+                                        let mut app = app.lock().unwrap();
+                                        app.logs.push_back(HttpLog {
+                                            url: format!("{} {} [Host: {}]", method, path, host),
+                                            request: forward.clone(),
+                                            response: resp_txt.replace("\r\n", "\n"),
+                                        });
                                     }
                                 }
-                                let path = format!("/{}", split.next().unwrap_or(""));
-                                (h.to_string(), p, path)
-                            } else {
-                                let host_hdr = request
-                                    .lines()
-                                    .find(|l| l.to_lowercase().starts_with("host:"))
-                                    .and_then(|l| l.splitn(2, ' ').nth(1))
-                                    .unwrap_or("127.0.0.1");
-                                let mut parts = host_hdr.split(':');
-                                let h = parts.next().unwrap_or("127.0.0.1").to_string();
-                                let p = parts.next().and_then(|x| x.parse().ok()).unwrap_or(80);
-                                (h, p, target.to_string())
-                            };
-
-                            // Build and forward HTTP request
-                            let forward = format!(
-                                "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                                method, path, host
-                            );
-                            if let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await {
-                                let _ = upstream.write_all(forward.as_bytes()).await;
-                                let mut resp_buf = Vec::new();
-                                let _ = upstream.read_to_end(&mut resp_buf).await;
-                                let _ = client.write_all(&resp_buf).await;
-
-                                // Log for TUI
-                                let resp_txt = String::from_utf8_lossy(&resp_buf).to_string();
-                                let mut app = app.lock().unwrap();
-                                app.logs.push_back(HttpLog {
-                                    url: format!("{} {} [Host: {}]", method, path, host),
-                                    request: forward.clone(),
-                                    response: resp_txt.replace("\r\n", "\n"),
-                                });
+                                Err(_) => break,
                             }
                         }
                     });
