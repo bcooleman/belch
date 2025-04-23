@@ -1,4 +1,4 @@
-// Belch Proxy TUI – Passive HTTP Observer with Split-Screen Viewer
+// Belch Proxy TUI – Passive HTTP/HTTPS Observer with Split-Screen Viewer
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -21,7 +21,7 @@ use ratatui::{
     Terminal,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream},
 };
 
@@ -39,24 +39,13 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        App { logs: VecDeque::new(), selected: 0 }
+        Self { logs: VecDeque::new(), selected: 0 }
     }
-    fn next(&mut self) {
-        if self.selected + 1 < self.logs.len() {
-            self.selected += 1;
-        }
-    }
-    fn previous(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
-        }
-    }
-    fn selected_log(&self) -> Option<&HttpLog> {
-        self.logs.get(self.selected)
-    }
+    fn next(&mut self) { if self.selected + 1 < self.logs.len() { self.selected += 1; } }
+    fn previous(&mut self) { if self.selected > 0 { self.selected -= 1; } }
+    fn selected_log(&self) -> Option<&HttpLog> { self.logs.get(self.selected) }
 }
 
-/// Spawn a thread running Tokio listener on 127.0.0.1:1337
 fn spawn_proxy_listener(app: Arc<Mutex<App>>) {
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -72,40 +61,61 @@ fn spawn_proxy_listener(app: Arc<Mutex<App>>) {
                         if let Ok(n) = client.read(&mut buf).await {
                             let request = String::from_utf8_lossy(&buf[..n]).to_string();
                             let mut lines = request.lines();
-                            let start_line = lines.next().unwrap_or("GET / HTTP/1.1");
+                            let start_line = lines.next().unwrap_or_default();
                             let parts: Vec<&str> = start_line.split_whitespace().collect();
-                            let method = parts.get(0).unwrap_or(&"GET");
-                            let target = parts.get(1).unwrap_or(&"/");
+                            let method = parts.get(0).copied().unwrap_or("");
+                            let target = parts.get(1).copied().unwrap_or("");
 
-                            // Manual absolute-URL parsing or Host header
+                            // Handle CONNECT tunnels (HTTP(S))
+                            if method.eq_ignore_ascii_case("CONNECT") {
+                                // target is "host:port"
+                                if let Ok(mut upstream) = TcpStream::connect(target).await {
+                                    // Inform client
+                                    let _ = client.write_all(
+                                        b"HTTP/1.1 200 Connection Established\r\n\r\n"
+                                    ).await;
+                                    // Tunnel data both ways
+                                    let _ = copy_bidirectional(&mut client, &mut upstream).await;
+
+                                    // Log CONNECT
+                                    let mut app = app.lock().unwrap();
+                                    app.logs.push_back(HttpLog {
+                                        url: format!("CONNECT {}", target),
+                                        request: start_line.to_string(),
+                                        response: "Tunnel established".to_string(),
+                                    });
+                                }
+                                return;
+                            }
+
+                            // Determine host, port, and clean path for non-CONNECT
                             let (host, port, path) = if target.starts_with("http://") {
-                                let rest = &target[7..]; // strip "http://"
+                                let rest = &target[7..];
                                 let mut split = rest.splitn(2, '/');
                                 let hp = split.next().unwrap_or("");
-                                let path = format!("/{}", split.next().unwrap_or(""));
                                 let mut h = hp;
                                 let mut p = 80;
                                 if let Some(idx) = hp.rfind(':') {
-                                    if let Ok(pp) = hp[idx+1..].parse::<u16>() {
+                                    if let Ok(pp) = hp[idx + 1..].parse::<u16>() {
                                         p = pp;
                                         h = &hp[..idx];
                                     }
                                 }
+                                let path = format!("/{}", split.next().unwrap_or(""));
                                 (h.to_string(), p, path)
                             } else {
-                                // Use Host: header for host and port, keep target as path
                                 let host_hdr = request
                                     .lines()
                                     .find(|l| l.to_lowercase().starts_with("host:"))
                                     .and_then(|l| l.splitn(2, ' ').nth(1))
                                     .unwrap_or("127.0.0.1");
-                                let mut hp = host_hdr.split(':');
-                                let h = hp.next().unwrap_or("127.0.0.1").to_string();
-                                let p = hp.next().and_then(|x| x.parse().ok()).unwrap_or(80);
+                                let mut parts = host_hdr.split(':');
+                                let h = parts.next().unwrap_or("127.0.0.1").to_string();
+                                let p = parts.next().and_then(|x| x.parse().ok()).unwrap_or(80);
                                 (h, p, target.to_string())
                             };
 
-                            // Construct and forward HTTP request
+                            // Build and forward HTTP request
                             let forward = format!(
                                 "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
                                 method, path, host
@@ -121,10 +131,8 @@ fn spawn_proxy_listener(app: Arc<Mutex<App>>) {
                                 let mut app = app.lock().unwrap();
                                 app.logs.push_back(HttpLog {
                                     url: format!("{} {} [Host: {}]", method, path, host),
-                                    request: forward.clone(),  // log the cleaned request
-                                    response: resp_txt.replace("
-", "
-"),
+                                    request: forward.clone(),
+                                    response: resp_txt.replace("\r\n", "\n"),
                                 });
                             }
                         }
@@ -170,7 +178,7 @@ fn run_app(
                 .constraints([Constraint::Length(30), Constraint::Min(50)])
                 .split(chunks[0]);
 
-            let request_list = app.logs.iter().enumerate().map(|(i, log)| {
+            let list = app.logs.iter().enumerate().map(|(i, log)| {
                 let style = if i == app.selected {
                     Style::default().fg(Color::Black).bg(Color::White)
                 } else {
@@ -180,20 +188,18 @@ fn run_app(
             }).collect::<Vec<_>>();
 
             f.render_widget(
-                Paragraph::new(request_list)
+                Paragraph::new(list)
                     .block(Block::default().borders(Borders::ALL).title("Requests")),
                 panels[0],
             );
 
             let mut detail = vec![Spans::from(Span::styled(
-                "Request:",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                "Request:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ))];
             if let Some(log) = app.selected_log() {
                 detail.extend(log.request.lines().map(|l| Spans::from(Span::raw(l))));
                 detail.push(Spans::from(Span::styled(
-                    "Response:",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    "Response:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                 )));
                 detail.extend(log.response.lines().map(|l| Spans::from(Span::raw(l))));
             } else {
