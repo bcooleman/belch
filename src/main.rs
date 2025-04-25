@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use crossterm::{
@@ -56,113 +55,106 @@ impl App {
     }
 }
 
-/// Start the proxy listener on localhost:1337
-fn spawn_proxy_listener(app: Arc<Mutex<App>>) {
-    thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            let listener = TcpListener::bind("127.0.0.1:1337").await.unwrap();
-            println!("🔌 Proxy listening on http://127.0.0.1:1337");
-            loop {
-                let (mut client, _) = listener.accept().await.unwrap();
-                let app = Arc::clone(&app);
-                tokio::spawn(async move {
-                    // Read first frame
-                    let mut buf = [0u8; 8192];
-                    let n = match client.read(&mut buf).await {
-                        Ok(n) if n > 0 => n,
-                        _ => return,
-                    };
-                    let header = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let mut lines = header.lines();
-                    let start = lines.next().unwrap_or_default();
-                    let mut parts = start.split_whitespace();
-                    let method = parts.next().unwrap_or("");
-                    let target = parts.next().unwrap_or("");
+/// Async HTTP/HTTPS proxy listener
+async fn spawn_proxy_listener(app: Arc<Mutex<App>>) {
+    let listener = TcpListener::bind("127.0.0.1:1337").await.unwrap();
+    println!("🔌 Proxy listening on http://127.0.0.1:1337");
+    loop {
+        let (mut client, _) = listener.accept().await.unwrap();
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            // Read initial frame
+            let mut buf = [0u8; 8192];
+            let n = match client.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+            let header = String::from_utf8_lossy(&buf[..n]).to_string();
+            let mut lines = header.lines();
+            let start = lines.next().unwrap_or_default();
+            let mut parts = start.split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
 
-                    // Split client into read/write halves
-                    let (mut client_r, mut client_w) = split(client);
+            // Split client into reader/writer
+            let (mut client_r, mut client_w) = split(client);
 
-                    if method.eq_ignore_ascii_case("CONNECT") {
-                        // Acknowledge tunnel
-                        let _ = client_w.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
-                        {
-                            let mut guard = app.lock().unwrap();
-                            guard.logs.push_back(HttpLog {
-                                url: format!("CONNECT {}", target),
-                                request: start.to_string(),
-                                response: "[Tunnel established]".to_string(),
-                            });
-                        }
-                        // Connect upstream
-                        if let Ok(upstream) = TcpStream::connect(target).await {
-                            let (mut up_r, mut up_w) = split(upstream);
-                            let mut cbuf = [0u8; 8192];
-                            let mut ubuf = [0u8; 8192];
-                            loop {
-                                // Read client -> upstream
-                                let cm = match client_r.read(&mut cbuf).await {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(m) => m,
-                                };
-                                let creq = String::from_utf8_lossy(&cbuf[..cm]).to_string();
-                                if up_w.write_all(&cbuf[..cm]).await.is_err() { break; }
-                                // Read upstream -> client
-                                let um = match up_r.read(&mut ubuf).await {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(m) => m,
-                                };
-                                let uresp = String::from_utf8_lossy(&ubuf[..um]).to_string();
-                                let _ = client_w.write_all(&ubuf[..um]).await;
-                                // Log as single entry
-                                let mut guard = app.lock().unwrap();
-                                guard.logs.push_back(HttpLog {
-                                    url: format!("Tunnel {}", target),
-                                    request: creq,
-                                    response: uresp,
-                                });
-                            }
-                        }
-                    } else {
-                        // Plain HTTP
-                        // header already contains initial request
-                        let request = header.clone();
-                        let mut lines = request.lines();
-                        let first = lines.next().unwrap_or_default();
-                        let parts: Vec<&str> = first.split_whitespace().collect();
-                        let meth = parts.get(0).copied().unwrap_or("");
-                        let path = parts.get(1).copied().unwrap_or("/");
-                        let host_hdr = request.lines()
-                            .find(|l| l.to_lowercase().starts_with("host:"))
-                            .and_then(|l| l.splitn(2, ' ').nth(1))
-                            .unwrap_or("127.0.0.1");
-                        let mut hp = host_hdr.split(':');
-                        let host = hp.next().unwrap_or("127.0.0.1");
-                        let port = hp.next().and_then(|x| x.parse().ok()).unwrap_or(80);
-                        let forward = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", meth, path, host);
-                        if let Ok(mut upstream) = TcpStream::connect((host, port)).await {
-                            let _ = upstream.write_all(forward.as_bytes()).await;
-                            let mut resp_buf = Vec::new();
-                            let _ = upstream.read_to_end(&mut resp_buf).await;
-                            let resp_str = String::from_utf8_lossy(&resp_buf).to_string().replace("\r\n", "\n");
-                            {
-                                let mut guard = app.lock().unwrap();
-                                guard.logs.push_back(HttpLog {
-                                    url: format!("{} {} [Host: {}]", meth, path, host),
-                                    request: forward.clone(),
-                                    response: resp_str.clone(),
-                                });
-                            }
-                            let _ = client_w.write_all(&resp_buf).await;
-                        }
+            if method.eq_ignore_ascii_case("CONNECT") {
+                // Acknowledge
+                let _ = client_w.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                { let mut guard = app.lock().unwrap();
+                    guard.logs.push_back(HttpLog {
+                        url: format!("CONNECT {}", target),
+                        request: start.to_string(),
+                        response: "[Tunnel established]".to_string(),
+                    });
+                }
+                // Connect upstream
+                if let Ok(upstream) = TcpStream::connect(target).await {
+                    let (mut up_r, mut up_w) = split(upstream);
+                    let mut cbuf = [0u8;8192];
+                    let mut ubuf = [0u8;8192];
+                    loop {
+                        // client->upstream
+                        let cm = match client_r.read(&mut cbuf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(m) => m,
+                        };
+                        let creq = String::from_utf8_lossy(&cbuf[..cm]).to_string();
+                        if up_w.write_all(&cbuf[..cm]).await.is_err() { break; }
+                        // upstream->client
+                        let um = match up_r.read(&mut ubuf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(m) => m,
+                        };
+                        let uresp = String::from_utf8_lossy(&ubuf[..um]).to_string();
+                        let _ = client_w.write_all(&ubuf[..um]).await;
+                        // Combined log
+                        let mut guard = app.lock().unwrap();
+                        guard.logs.push_back(HttpLog {
+                            url: format!("Tunnel {}", target),
+                            request: creq,
+                            response: uresp,
+                        });
                     }
-                });
+                }
+            } else {
+                // Plain HTTP
+                let request = header.clone();
+                let mut lines = request.lines();
+                let first = lines.next().unwrap_or_default();
+                let parts: Vec<&str> = first.split_whitespace().collect();
+                let meth = parts.get(0).copied().unwrap_or("");
+                let path = parts.get(1).copied().unwrap_or("/");
+                let host_hdr = request.lines()
+                    .find(|l| l.to_lowercase().starts_with("host:"))
+                    .and_then(|l| l.splitn(2, ' ').nth(1))
+                    .unwrap_or("127.0.0.1");
+                let mut hp = host_hdr.split(':');
+                let host = hp.next().unwrap_or("127.0.0.1");
+                let port = hp.next().and_then(|x| x.parse().ok()).unwrap_or(80);
+                let forward = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", meth, path, host);
+                if let Ok(mut upstream) = TcpStream::connect((host, port)).await {
+                    let _ = upstream.write_all(forward.as_bytes()).await;
+                    let mut resp_buf = Vec::new();
+                    let _ = upstream.read_to_end(&mut resp_buf).await;
+                    let resp_string = String::from_utf8_lossy(&resp_buf).to_string().replace("\r\n","\n");
+                    { let mut guard = app.lock().unwrap();
+                        guard.logs.push_back(HttpLog {
+                            url: format!("{} {} [Host: {}]", meth, path, host),
+                            request: forward.clone(),
+                            response: resp_string.clone(),
+                        });
+                    }
+                    let _ = client_w.write_all(&resp_buf).await;
+                }
             }
         });
-    });
+    }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -170,7 +162,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let app = Arc::new(Mutex::new(App::new()));
-    spawn_proxy_listener(app.clone());
+    // Spawn one runtime-based listener
+    tokio::spawn(spawn_proxy_listener(app.clone()));
+
+    // Run TUI in the current thread
     run_app(&mut terminal, app)?;
 
     disable_raw_mode()?;
@@ -197,7 +192,6 @@ fn run_app(
                 .constraints([Constraint::Length(30), Constraint::Min(50)])
                 .split(chunks[0]);
 
-            // Requests list
             let list = guard.logs.iter().enumerate().map(|(i, log)| {
                 let style = if i == guard.selected { Style::default().fg(Color::Black).bg(Color::White) } else { Style::default() };
                 Spans::from(Span::styled(log.url.clone(), style))
@@ -208,7 +202,6 @@ fn run_app(
                 panels[0],
             );
 
-            // Detail pane
             let mut detail = vec![Spans::from(Span::styled(
                 "Request:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ))];
@@ -228,7 +221,6 @@ fn run_app(
                 panels[1],
             );
 
-            // Footer
             f.render_widget(
                 Paragraph::new("↑↓: Navigate   Q: Quit")
                     .style(Style::default().fg(Color::DarkGray)),
