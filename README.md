@@ -8,3 +8,5 @@ current bug: need to resize the screen once..
 
 ![belch](https://github.com/user-attachments/assets/78f396c4-b914-45ec-b712-d7b5cfea690a)<br><br>
 <img width="1270" alt="Screenshot 2025-04-25 at 12 46 05 AM" src="https://github.com/user-attachments/assets/2d2e0483-d2be-4766-a876-19fb2e623573" />
+https://github.com/user-attachments/assets/b5590cfa-d77a-43ce-b958-521feab602f5
+
